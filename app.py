@@ -1,3 +1,4 @@
+import os
 from html import escape
 from flask import Flask, Response, request
 import requests
@@ -13,23 +14,64 @@ except ImportError:
 
 app = Flask(__name__)
 
-_CHROME_IMPERSONATE = 'chrome124'
+# TLS giống Chrome; thử vài bản nếu site trả 403 (chỉ khi không stream)
+_CURL_IMPERSONATE_TRY = ('chrome131', 'chrome124', 'chrome120')
+_CHROME_MAJOR = '131'
 USER_AGENT = (
     'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
-    '(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
+    '(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36'
 )
 
 
+def outbound_proxies() -> dict[str, str] | None:
+    raw = (
+        os.environ.get('HTTPS_PROXY')
+        or os.environ.get('https_proxy')
+        or os.environ.get('OUTBOUND_HTTP_PROXY')
+        or ''
+    ).strip()
+    if not raw:
+        return None
+    return {'http': raw, 'https': raw}
+
+
 def http_get(url: str, headers: dict[str, str], *, stream: bool = False, timeout: int = 60):
+    proxies = outbound_proxies()
     if _USE_CURL_CFFI and curl_requests is not None:
-        return curl_requests.get(
-            url,
-            headers=headers,
-            impersonate=_CHROME_IMPERSONATE,
-            timeout=timeout,
-            stream=stream,
-        )
-    return requests.get(url, headers=headers, timeout=timeout, stream=stream)
+        if stream:
+            return curl_requests.get(
+                url,
+                headers=headers,
+                impersonate=_CURL_IMPERSONATE_TRY[0],
+                timeout=timeout,
+                stream=True,
+                proxies=proxies,
+            )
+        last = None
+        for impersonate in _CURL_IMPERSONATE_TRY:
+            try:
+                resp = curl_requests.get(
+                    url,
+                    headers=headers,
+                    impersonate=impersonate,
+                    timeout=timeout,
+                    stream=False,
+                    proxies=proxies,
+                )
+            except Exception:
+                continue
+            last = resp
+            if resp.status_code != 403:
+                return resp
+        if last is not None:
+            return last
+    return requests.get(
+        url,
+        headers=headers,
+        timeout=timeout,
+        stream=stream,
+        proxies=proxies,
+    )
 
 # Thử lần lượt; nhiều theme Madara / WordPress / reader khác nhau
 MANGA_IMG_SELECTORS = (
@@ -74,6 +116,12 @@ def request_headers_for(
         'Referer': referer,
         'Accept-Language': 'en-US,en;q=0.9,ko;q=0.85,vi;q=0.8',
         'Accept-Encoding': 'gzip, deflate',
+        'sec-ch-ua': (
+            f'"Google Chrome";v="{_CHROME_MAJOR}", "Chromium";v="{_CHROME_MAJOR}", '
+            '"Not_A Brand";v="8"'
+        ),
+        'sec-ch-ua-mobile': '?0',
+        'sec-ch-ua-platform': '"Windows"',
     }
     if for_image:
         headers['Accept'] = (
@@ -261,10 +309,23 @@ def read_manga():
         return html_content
         
     except Exception as e:
+        err_text = escape(str(e))
+        hint = ''
+        if '403' in str(e):
+            hint = (
+                "<p style='max-width:640px;line-height:1.5;color:#c8d0e0'>"
+                "<strong>403 từ site nguồn:</strong> Nhiều site (Cloudflare) "
+                "<strong>chặn IP máy chủ cloud</strong> như Render — không phải lỗi code. "
+                "Cách xử lý: chạy app <strong>tại nhà + ngrok</strong>; hoặc trên Render thêm "
+                "biến môi trường <code style='color:#ffd4a8'>HTTPS_PROXY</code> / "
+                "<code style='color:#ffd4a8'>OUTBOUND_HTTP_PROXY</code> trỏ tới proxy HTTP "
+                "(thường là proxy residential có phí) rồi deploy lại.</p>"
+            )
         return f"""
         <div style='font-family:Segoe UI,Arial,sans-serif;padding:20px;background:#130f15;color:#ffd7d7'>
             <h2 style='margin-top:0;color:#ff8f8f'>Lỗi khi tải truyện</h2>
-            <div>{e}</div>
+            {hint}
+            <div style='margin:12px 0'>{err_text}</div>
             <p><a style='color:#8fc8ff' href='/'>Quay lại trang chính</a></p>
         </div>
         """
