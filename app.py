@@ -4,12 +4,32 @@ import requests
 from bs4 import BeautifulSoup
 from urllib.parse import quote, urlparse, urljoin
 
+try:
+    from curl_cffi import requests as curl_requests
+    _USE_CURL_CFFI = True
+except ImportError:
+    curl_requests = None
+    _USE_CURL_CFFI = False
+
 app = Flask(__name__)
 
+_CHROME_IMPERSONATE = 'chrome124'
 USER_AGENT = (
     'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
-    '(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
+    '(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
 )
+
+
+def http_get(url: str, headers: dict[str, str], *, stream: bool = False, timeout: int = 60):
+    if _USE_CURL_CFFI and curl_requests is not None:
+        return curl_requests.get(
+            url,
+            headers=headers,
+            impersonate=_CHROME_IMPERSONATE,
+            timeout=timeout,
+            stream=stream,
+        )
+    return requests.get(url, headers=headers, timeout=timeout, stream=stream)
 
 # Thử lần lượt; nhiều theme Madara / WordPress / reader khác nhau
 MANGA_IMG_SELECTORS = (
@@ -31,14 +51,48 @@ def origin_from_url(url: str) -> str:
     return ''
 
 
-def request_headers_for(resource_url: str, page_url: str | None = None) -> dict[str, str]:
+def request_headers_for(
+    resource_url: str,
+    page_url: str | None = None,
+    *,
+    for_image: bool = False,
+) -> dict[str, str]:
     if page_url:
         referer = page_url
     else:
         referer = origin_from_url(resource_url)
     if not referer:
         referer = 'https://example.com/'
-    return {'User-Agent': USER_AGENT, 'Referer': referer}
+    parsed = urlparse(resource_url)
+    site = (
+        'cross-site'
+        if parsed.netloc and referer and parsed.netloc not in referer
+        else 'same-origin'
+    )
+    headers: dict[str, str] = {
+        'User-Agent': USER_AGENT,
+        'Referer': referer,
+        'Accept-Language': 'en-US,en;q=0.9,ko;q=0.85,vi;q=0.8',
+        'Accept-Encoding': 'gzip, deflate',
+    }
+    if for_image:
+        headers['Accept'] = (
+            'image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8'
+        )
+        headers['Sec-Fetch-Dest'] = 'image'
+        headers['Sec-Fetch-Mode'] = 'no-cors'
+        headers['Sec-Fetch-Site'] = site
+    else:
+        headers['Accept'] = (
+            'text/html,application/xhtml+xml,application/xml;q=0.9,'
+            'image/avif,image/webp,*/*;q=0.8'
+        )
+        headers['Upgrade-Insecure-Requests'] = '1'
+        headers['Sec-Fetch-Dest'] = 'document'
+        headers['Sec-Fetch-Mode'] = 'navigate'
+        headers['Sec-Fetch-Site'] = 'none'
+        headers['Sec-Fetch-User'] = '?1'
+    return headers
 
 
 def collect_manga_image_urls(soup: BeautifulSoup, base_url: str) -> list[str]:
@@ -68,8 +122,8 @@ def read_manga():
     )
     
     try:
-        page_headers = request_headers_for(target_url)
-        response = requests.get(target_url, headers=page_headers, timeout=60)
+        page_headers = request_headers_for(target_url, for_image=False)
+        response = http_get(target_url, page_headers, stream=False, timeout=60)
         response.raise_for_status()
         soup = BeautifulSoup(response.content, 'html.parser')
         image_urls = collect_manga_image_urls(soup, target_url)
@@ -222,11 +276,11 @@ def get_image():
     if not img_url:
         return "Thiếu URL ảnh", 400
     page_ref = request.args.get('ref')
-    img_headers = request_headers_for(img_url, page_url=page_ref)
+    img_headers = request_headers_for(img_url, page_url=page_ref, for_image=True)
     try:
-        req = requests.get(img_url, headers=img_headers, stream=True, timeout=60)
+        req = http_get(img_url, img_headers, stream=True, timeout=60)
         req.raise_for_status()
-    except requests.RequestException as err:
+    except Exception as err:
         return f"Lỗi tải ảnh: {err}", 502
     return Response(
         req.iter_content(chunk_size=1024),
