@@ -1,0 +1,5 @@
+.env
+__pycache__
+ngrok-config-authtoken.bat
+.ngrok.exe.old
+ngrok.exe
